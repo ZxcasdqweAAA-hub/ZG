@@ -44,11 +44,52 @@
         ORDER BY created_at DESC LIMIT #{limit} OFFSET #{offset}
     </select>
 
+    <select id="listAllFollowingRows" resultType="map">
+        SELECT to_user_id AS toUserId, created_at AS createdAt
+        FROM following
+        WHERE from_user_id=#{fromUserId} AND rel_status=1
+        ORDER BY created_at DESC
+    </select>
+
+    <select id="listFollowingRowsBeforeCursor" resultType="map">
+        SELECT to_user_id AS toUserId, created_at AS createdAt
+        FROM following
+        WHERE from_user_id=#{fromUserId}
+          AND rel_status=1
+          AND created_at &lt; FROM_UNIXTIME(#{cursor} / 1000)
+        ORDER BY created_at DESC LIMIT #{limit}
+    </select>
+
     <select id="listFollowerRows" resultType="map">
         SELECT from_user_id AS fromUserId, created_at AS createdAt
         FROM follower
         WHERE to_user_id=#{toUserId} AND rel_status=1
         ORDER BY created_at DESC LIMIT #{limit} OFFSET #{offset}
+    </select>
+
+    <select id="listTopFollowerRows" resultType="map">
+        SELECT from_user_id AS fromUserId, created_at AS createdAt
+        FROM follower
+        WHERE to_user_id=#{toUserId} AND rel_status=1
+        ORDER BY created_at DESC LIMIT #{limit}
+    </select>
+
+    <select id="listFollowerRowsBeforeCursor" resultType="map">
+        SELECT from_user_id AS fromUserId, created_at AS createdAt
+        FROM follower
+        WHERE to_user_id=#{toUserId}
+          AND rel_status=1
+          AND created_at &lt; FROM_UNIXTIME(#{cursor} / 1000)
+        ORDER BY created_at DESC LIMIT #{limit}
+    </select>
+
+    <select id="listFollowersBeforeCursor" resultType="long">
+        SELECT from_user_id
+        FROM follower
+        WHERE to_user_id=#{toUserId}
+          AND rel_status=1
+          AND created_at &lt; FROM_UNIXTIME(#{cursor} / 1000)
+        ORDER BY created_at DESC LIMIT #{limit}
     </select>
 
     <select id="countFollowingActive" resultType="int">

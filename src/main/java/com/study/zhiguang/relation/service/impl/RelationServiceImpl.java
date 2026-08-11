@@ -1,53 +1,41 @@
 package com.study.zhiguang.relation.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
+import com.study.zhiguang.profile.api.dto.ProfileResponse;
 import com.study.zhiguang.relation.event.RelationEvent;
 import com.study.zhiguang.relation.mapper.RelationMapper;
 import com.study.zhiguang.relation.outbox.OutboxMapper;
 import com.study.zhiguang.relation.service.RelationService;
 import com.study.zhiguang.user.domain.User;
 import com.study.zhiguang.user.mapper.UserMapper;
-import com.study.zhiguang.profile.api.dto.ProfileResponse;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-
 import java.sql.Timestamp;
 import java.time.Duration;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.function.IntFunction;
 
-/**
- * 关系服务实现。
- * 设计要点：
- * - 写路径：关注/取消关注经 Lua 令牌桶限流后入库，并以 Outbox 事件异步驱动粉丝表更新与缓存维护；
- * - 读路径：优先读取 Redis ZSet（关注/粉丝）并按需回填，支持偏移与游标两种分页；大V用户启用本地 Top 缓存；
- * - 计数：用户维度计数（关注/粉丝等）通过独立服务维护，阈值判断如“大V”基于 SDS 段值；
- * - 并发与一致性：回填后设置短 TTL，降低陈旧风险；Outbox 事件消费者提供幂等与去重保障。
- */
 @Service
 public class RelationServiceImpl implements RelationService {
+    private static final Duration RELATION_CACHE_TTL = Duration.ofHours(2);
+    private static final int FANS_CACHE_LIMIT = 500;
+
     private final RelationMapper mapper;
     private final OutboxMapper outboxMapper;
     private final StringRedisTemplate redis;
     private final DefaultRedisScript<Long> tokenScript;
     private final ObjectMapper objectMapper;
-    private final Cache<Long, List<Long>> flwsTopCache;
-    private final Cache<Long, List<Long>> fansTopCache;
     private final UserMapper userMapper;
 
-    /**
-     * 关系服务实现构造函数。
-     * @param mapper 关系表数据访问
-     * @param outboxMapper Outbox 事件写入访问
-     * @param redis Redis 客户端
-     * @param objectMapper JSON 序列化器
-     */
     public RelationServiceImpl(RelationMapper mapper,
                                OutboxMapper outboxMapper,
                                StringRedisTemplate redis,
@@ -60,20 +48,12 @@ public class RelationServiceImpl implements RelationService {
         this.tokenScript = new DefaultRedisScript<>();
         this.tokenScript.setResultType(Long.class);
         this.tokenScript.setScriptText(TOKEN_BUCKET_LUA);
-        this.flwsTopCache = Caffeine.newBuilder().maximumSize(1000).expireAfterWrite(Duration.ofMinutes(10)).build();
-        this.fansTopCache = Caffeine.newBuilder().maximumSize(1000).expireAfterWrite(Duration.ofMinutes(10)).build();
         this.userMapper = userMapper;
     }
 
-    /**
-     * 关注操作，限流通过令牌桶，并写入 Outbox 以异步构建缓存与粉丝表。
-     * @param fromUserId 发起关注的用户ID
-     * @param toUserId 被关注的用户ID
-     * @return 是否关注成功
-     */
+    @Override
     @Transactional
     public boolean follow(long fromUserId, long toUserId) {
-        // Lua 脚本令牌桶限流
         Long ok = redis.execute(tokenScript, List.of("rl:follow:" + fromUserId), "100", "1");
         if (ok == 0L) {
             return false;
@@ -87,19 +67,14 @@ public class RelationServiceImpl implements RelationService {
                 Long outId = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
                 String payload = objectMapper.writeValueAsString(new RelationEvent("FollowCreated", fromUserId, toUserId, id));
                 outboxMapper.insert(outId, "following", id, "FollowCreated", payload);
-            } catch (Exception ignored) {}
-
+            } catch (Exception ignored) {
+            }
             return true;
         }
         return false;
     }
 
-    /**
-     * 取消关注操作，并写入 Outbox 事件。
-     * @param fromUserId 发起取消关注的用户ID
-     * @param toUserId 被取消关注的用户ID
-     * @return 是否取消成功
-     */
+    @Override
     @Transactional
     public boolean unfollow(long fromUserId, long toUserId) {
         int updated = mapper.cancelFollowing(fromUserId, toUserId);
@@ -108,70 +83,65 @@ public class RelationServiceImpl implements RelationService {
                 Long outId = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
                 String payload = objectMapper.writeValueAsString(new RelationEvent("FollowCanceled", fromUserId, toUserId, null));
                 outboxMapper.insert(outId, "following", null, "FollowCanceled", payload);
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
             return true;
         }
         return false;
     }
 
-    /**
-     * 判断是否已关注。
-     * @param fromUserId 关注发起者
-     * @param toUserId 被关注者
-     * @return 是否已关注
-     */
+    @Override
     public boolean isFollowing(long fromUserId, long toUserId) {
         return mapper.existsFollowing(fromUserId, toUserId) > 0;
     }
 
-    /**
-     * 获取关注列表（偏移分页），优先读取 Redis ZSet，未命中时回填并设置 TTL。
-     * @param userId 用户ID
-     * @param limit 返回数量上限
-     * @param offset 偏移量
-     * @return 关注的用户ID列表
-     */
+    @Override
     public List<Long> following(long userId, int limit, int offset) {
-        String key = "uf:flws:" + userId;
-        return getListWithOffset(
-                key,
-                offset,
-                limit,
-                need -> mapper.listFollowingRows(userId, need, 0),
-                "toUserId",
-                "createdAt",
-                flwsTopCache,
-                userId
-        );
+        if (limit <= 0) {
+            return List.of();
+        }
+        String key = followingKey(userId);
+        if (Boolean.TRUE.equals(redis.hasKey(key))) {
+            // 关注缓存是全量缓存，返回不足 limit 代表已经到达列表末尾。
+            return zsetOffset(key, offset, limit);
+        }
+
+        // 缓存不存在时，当前请求直接由数据库回答；全量数据只用于构建关注缓存。
+        List<Long> result = mapper.listFollowing(userId, limit, offset);
+        rebuildFullFollowingCache(userId, key);
+        return result;
     }
 
-    /**
-     * 获取粉丝列表（偏移分页），ZSet 优先，DB 回填并设置 TTL。
-     * @param userId 用户ID
-     * @param limit 返回数量上限
-     * @param offset 偏移量
-     * @return 粉丝用户ID列表
-     */
+    @Override
     public List<Long> followers(long userId, int limit, int offset) {
-        String key = "uf:fans:" + userId;
-        return getListWithOffset(
-                key,
-                offset,
-                limit,
-                need -> mapper.listFollowerRows(userId, need, 0),
-                "fromUserId",
-                "createdAt",
-                fansTopCache,
-                userId
-        );
+        if (limit <= 0) {
+            return List.of();
+        }
+        String key = fansKey(userId);
+        boolean exists = Boolean.TRUE.equals(redis.hasKey(key));
+
+        if (!exists) {
+            // 当前页必须直接由数据库回答，因为本次请求可能已经超出 Top 500。
+            List<Long> result = mapper.listFollowers(userId, limit, offset);
+            rebuildTopFansCache(userId, key);
+            return result;
+        }
+
+        if (!withinFansCache(offset, limit)) {
+            return mapper.listFollowers(userId, limit, offset);
+        }
+
+        Long cachedSize = redis.opsForZSet().zCard(key);
+        long requiredSize = (long) offset + limit;
+        if (cachedSize == null || cachedSize < requiredSize) {
+            // Top 500 可能因取关出现空洞；已有缓存不在这里补位，等待 TTL 后重建。
+            return mapper.listFollowers(userId, limit, offset);
+        }
+
+        return zsetOffset(key, offset, limit);
     }
 
-    /**
-     * 查询双方关系状态。
-     * @param userId 当前用户ID
-     * @param otherUserId 对方用户ID
-     * @return 三态关系：following/followedBy/mutual
-     */
+    @Override
     public Map<String, Boolean> relationStatus(long userId, long otherUserId) {
         boolean following = isFollowing(userId, otherUserId);
         boolean followedBy = isFollowing(otherUserId, userId);
@@ -183,159 +153,113 @@ public class RelationServiceImpl implements RelationService {
         return m;
     }
 
-    /**
-     * 游标分页获取关注列表，按创建时间倒序基于 ZSet 分数。
-     * @param userId 用户ID
-     * @param limit 返回数量上限
-     * @param cursor 上一页末条的分数（毫秒时间戳），为空代表第一页
-     * @return 关注的用户ID列表
-     */
+    @Override
     public List<Long> followingCursor(long userId, int limit, Long cursor) {
-        String key = "uf:flws:" + userId;
-        return getListWithCursor(
-                key,
-                limit,
-                cursor,
-                need -> mapper.listFollowingRows(userId, need, 0),
-                "toUserId",
-                "createdAt"
-        );
+        if (limit <= 0) {
+            return List.of();
+        }
+        String key = followingKey(userId);
+        if (Boolean.TRUE.equals(redis.hasKey(key))) {
+            // 关注缓存是全量缓存，游标查询不足 limit 代表已经到达末尾。
+            return zsetCursor(key, limit, cursor);
+        }
+
+        List<Long> result = listFollowingFromDatabaseByCursor(userId, limit, cursor);
+        rebuildFullFollowingCache(userId, key);
+        return result;
     }
 
-    /**
-     * 游标分页获取粉丝列表。
-     * @param userId 用户ID
-     * @param limit 返回数量上限
-     * @param cursor 上一页末条的分数（毫秒时间戳），为空代表第一页
-     * @return 粉丝用户ID列表
-     */
+    @Override
     public List<Long> followersCursor(long userId, int limit, Long cursor) {
-        String key = "uf:fans:" + userId;
-        return getListWithCursor(
-                key,
-                limit,
-                cursor,
-                need -> mapper.listFollowerRows(userId, need, 0),
-                "fromUserId",
-                "createdAt"
-        );
+        if (limit <= 0) {
+            return List.of();
+        }
+        String key = fansKey(userId);
+        boolean exists = Boolean.TRUE.equals(redis.hasKey(key));
+
+        if (!exists) {
+            // 数据库回答当前游标请求，Top 500 仅用于建立后续请求的读缓存。
+            List<Long> result = listFollowersFromDatabaseByCursor(userId, limit, cursor);
+            rebuildTopFansCache(userId, key);
+            return result;
+        }
+
+        List<Long> cached = zsetCursor(key, limit, cursor);
+        if (cached.size() >= limit) {
+            return cached;
+        }
+
+        // 返回不足可能是真正到尾部，也可能是 Top 500 边界或取关造成的空洞。
+        // 当前没有完整性元数据，因此回源数据库，且不修改已经存在的缓存。
+        return listFollowersFromDatabaseByCursor(userId, limit, cursor);
     }
 
+    @Override
     public List<ProfileResponse> followingProfiles(long userId, int limit, int offset, Long cursor) {
-        List<Long> ids = cursor != null ? followingCursor(userId, limit, cursor)
-                : following(userId, limit, offset);
+        List<Long> ids = cursor != null ? followingCursor(userId, limit, cursor) : following(userId, limit, offset);
         return toProfiles(ids);
     }
 
+    @Override
     public List<ProfileResponse> followersProfiles(long userId, int limit, int offset, Long cursor) {
-        List<Long> ids = cursor != null ? followersCursor(userId, limit, cursor)
-                : followers(userId, limit, offset);
+        List<Long> ids = cursor != null ? followersCursor(userId, limit, cursor) : followers(userId, limit, offset);
         return toProfiles(ids);
     }
 
-    private List<ProfileResponse> toProfiles(List<Long> ids) {
-        if (ids == null || ids.isEmpty()) return List.of();
-        List<User> users = userMapper.listByIds(ids);
-        Map<Long, User> m = new LinkedHashMap<>(users.size());
-        for (User u : users) m.put(u.getId(), u);
-        List<ProfileResponse> out = new ArrayList<>(ids.size());
-        for (Long id : ids) {
-            User u = m.get(id);
-            if (u == null) continue;
-            out.add(new ProfileResponse(u.getId(), u.getNickname(), u.getAvatar(), u.getBio(), u.getZgId(), u.getGender(), u.getBirthday(), u.getSchool(), u.getPhone(), u.getEmail(), u.getTagsJson()));
+    private void rebuildFullFollowingCache(long userId, String key) {
+        if (Boolean.TRUE.equals(redis.hasKey(key))) {
+            return;
         }
-        return out;
+        Map<Long, Map<String, Object>> rows = mapper.listAllFollowingRows(userId);
+        if (rows == null || rows.isEmpty()) {
+            return;
+        }
+        fillZSet(key, rows, "toUserId", "createdAt", null);
+        redis.expire(key, RELATION_CACHE_TTL);
     }
 
-
-    /**
-     * 偏移分页读取：优先命中 ZSet，未命中时从 DB 回填并设置 TTL；大V用户维护本地 Top 缓存以降低冷启动开销。
-     */
-    private List<Long> getListWithOffset(
-            String key,
-            int offset,
-            int limit,
-            IntFunction<Map<Long, Map<String, Object>>> rowsFetcher,
-            String idField,
-            String tsField,
-            Cache<Long, List<Long>> localCache,
-            long userId
-    ) {
-        // 1. 先查本地缓存 (L1)
-//        List<Long> top = localCache != null ? localCache.getIfPresent(userId) : null;
-//        if (top != null && !top.isEmpty()) {
-//            // 本地缓存通常只存 Top N (例如前500)，如果 offset 在范围内则直接返回
-//            if (offset < top.size()) {
-//                int to = Math.min(offset + limit, top.size());
-//                return new ArrayList<>(top.subList(offset, to));
-//            }
-//            // 如果请求的 offset 超过了本地缓存范围，继续查 Redis
-//        }
-
-        // 2. 再查 Redis (L2)
-        // 新插入的时间较大
-        Set<String> cached = redis.opsForZSet().reverseRange(key, offset, offset + limit - 1L);
-        if (cached != null && !cached.isEmpty()) {
-            return toLongList(cached);
+    private void rebuildTopFansCache(long userId, String key) {
+        if (Boolean.TRUE.equals(redis.hasKey(key))) {
+            return;
         }
-
-        // 3. 最后查 DB 回填
-        int need = Math.max(1, limit + offset);
-        Map<Long, Map<String, Object>> rows = rowsFetcher.apply(Math.min(need, 1000));
-        if (rows != null && !rows.isEmpty()) {
-            fillZSet(key, rows, idField, tsField, null);
-            redis.expire(key, Duration.ofHours(2));
-
-            // 回填后尝试更新本地缓存（仅针对大V）
-//            if (localCache != null && isBigV(userId)) {
-//                maybeUpdateTopCache(userId, key, localCache);
-//            }
-            Set<String> filled = redis.opsForZSet().reverseRange(key, offset, offset + limit - 1L);
-            return filled == null ? Collections.emptyList() : toLongList(filled);
+        Map<Long, Map<String, Object>> rows = mapper.listTopFollowerRows(userId, FANS_CACHE_LIMIT);
+        if (rows == null || rows.isEmpty()) {
+            return;
         }
-        return Collections.emptyList();
+        fillZSet(key, rows, "fromUserId", "createdAt", null);
+        redis.expire(key, RELATION_CACHE_TTL);
     }
 
-    /**
-     * 游标分页读取：按分数（毫秒时间戳）倒序读取；未命中时回填满足所需范围的数据并继续读取。
-     */
-    private List<Long> getListWithCursor(String key,
-                                         int limit,
-                                         Long cursor,
-                                         IntFunction<Map<Long, Map<String, Object>>> rowsFetcher,
-                                         String idField,
-                                         String tsField) {
-        double max = cursor == null ? Double.POSITIVE_INFINITY : cursor.doubleValue();
-        Set<String> cached = redis.opsForZSet().reverseRangeByScore(key, Double.NEGATIVE_INFINITY, max, 0, limit);
-
-        if (cached != null && !cached.isEmpty()) {
-            return toLongList(cached);
+    private List<Long> listFollowingFromDatabaseByCursor(long userId, int limit, Long cursor) {
+        if (cursor == null) {
+            return mapper.listFollowing(userId, limit, 0);
         }
-
-        int need = Math.max(limit, 100);
-        Map<Long, Map<String, Object>> rows = rowsFetcher.apply(Math.min(need, 1000));
-
-        if (rows != null && !rows.isEmpty()) {
-            fillZSet(key, rows, idField, tsField, cursor);
-            redis.expire(key, Duration.ofHours(2));
-            Set<String> filled = redis.opsForZSet().reverseRangeByScore(key, Double.NEGATIVE_INFINITY, max, 0, limit);
-            return filled == null ? Collections.emptyList() : toLongList(filled);
-        }
-        return Collections.emptyList();
+        Map<Long, Map<String, Object>> rows = mapper.listFollowingRowsBeforeCursor(userId, cursor, limit);
+        return rowIdsOrderedByScore(rows, "toUserId", "createdAt");
     }
 
-    /**
-     * 将字符串集合按原顺序映射为长整型列表。
-     */
-    private List<Long> toLongList(Set<String> set) {
-        List<Long> out = new ArrayList<>(set.size());
-        for (String s : set) out.add(Long.valueOf(s));
-        return out;
+    private List<Long> listFollowersFromDatabaseByCursor(long userId, int limit, Long cursor) {
+        if (cursor == null) {
+            return mapper.listFollowers(userId, limit, 0);
+        }
+        return mapper.listFollowersBeforeCursor(userId, cursor, limit);
     }
 
-    /**
-     * 将行数据填充至 ZSet：分值为创建时间戳；若提供游标则只填充不高于游标的记录。
-     */
+    private boolean withinFansCache(int offset, int limit) {
+        return offset >= 0 && (long) offset + limit <= FANS_CACHE_LIMIT;
+    }
+
+    private List<Long> zsetOffset(String key, int offset, int limit) {
+        Set<String> set = redis.opsForZSet().reverseRange(key, offset, offset + limit - 1L);
+        return set == null ? Collections.emptyList() : toLongList(set);
+    }
+
+    private List<Long> zsetCursor(String key, int limit, Long cursor) {
+        double max = cursor == null ? Double.POSITIVE_INFINITY : cursor.doubleValue() - 1D;
+        Set<String> set = redis.opsForZSet().reverseRangeByScore(key, Double.NEGATIVE_INFINITY, max, 0, limit);
+        return set == null ? Collections.emptyList() : toLongList(set);
+    }
+
     private void fillZSet(String key,
                           Map<Long, Map<String, Object>> rows,
                           String idField,
@@ -344,17 +268,16 @@ public class RelationServiceImpl implements RelationService {
         for (Map<String, Object> r : rows.values()) {
             Object idObj = r.get(idField);
             Object tsObj = r.get(tsField);
-            if (idObj == null || tsObj == null) continue;
+            if (idObj == null || tsObj == null) {
+                continue;
+            }
             long score = tsScore(tsObj);
-            if (cursor == null || score <= cursor) {
+            if (cursor == null || score < cursor) {
                 redis.opsForZSet().add(key, String.valueOf(idObj), score);
             }
         }
     }
 
-    /**
-     * 将多类型时间对象统一转换为毫秒分值。
-     */
     private long tsScore(Object tsObj) {
         if (tsObj instanceof Timestamp ts) {
             return ts.getTime();
@@ -365,26 +288,55 @@ public class RelationServiceImpl implements RelationService {
         return System.currentTimeMillis();
     }
 
-    /*
-    理一下这个lua脚本 （以follow为例子
-    key是限流key（比如rl:follow:1) capacity是100 rate是1
-    now是redis服务器当前的时间 last是上次更新时间 这两个是通过查询redis的哈希表得到的
-    当然不存在redis字段的话就初始化 last是now tokens是capacity
+    private List<Long> rowIdsOrderedByScore(Map<Long, Map<String, Object>> rows,
+                                            String idField,
+                                            String tsField) {
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        return rows.values().stream()
+                .filter(row -> row.get(idField) != null && row.get(tsField) != null)
+                .sorted((left, right) -> Long.compare(tsScore(right.get(tsField)), tsScore(left.get(tsField))))
+                .map(row -> Long.valueOf(String.valueOf(row.get(idField))))
+                .toList();
+    }
 
-    然后进入令牌补充阶段
-    计算当前时间now和last的差，就是经过的秒数（call('TIME')[1]单位是秒），记为 elapsed
-    加上 rate * elapsed，即要补充的token
+    private List<Long> toLongList(Set<String> set) {
+        List<Long> out = new ArrayList<>(set.size());
+        for (String s : set) {
+            out.add(Long.valueOf(s));
+        }
+        return out;
+    }
 
-    然后就是更具tokens的数量判断是否允许请求
-    如果数量小于1 不接受
-    否则 数量减少1 接受
+    private List<ProfileResponse> toProfiles(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return List.of();
+        }
+        List<User> users = userMapper.listByIds(ids);
+        Map<Long, User> m = new LinkedHashMap<>(users.size());
+        for (User u : users) {
+            m.put(u.getId(), u);
+        }
+        List<ProfileResponse> out = new ArrayList<>(ids.size());
+        for (Long id : ids) {
+            User u = m.get(id);
+            if (u == null) {
+                continue;
+            }
+            out.add(new ProfileResponse(u.getId(), u.getNickname(), u.getAvatar(), u.getBio(), u.getZgId(), u.getGender(), u.getBirthday(), u.getSchool(), u.getPhone(), u.getEmail(), u.getTagsJson()));
+        }
+        return out;
+    }
 
-    这边设置过期时间是为了节省内存和自动重置
+    private String followingKey(long userId) {
+        return "uf:flws:" + userId;
+    }
 
-    用lua脚本的
-    原子性，redis会串行处理；整个脚本会作为一个原子操作执行，中间不会被其他客户端的命令打断
-    便于维护，且执行效率高
-     */
+    private String fansKey(long userId) {
+        return "uf:fans:" + userId;
+    }
+
     private static final String TOKEN_BUCKET_LUA = """
             
             local key = KEYS[1]

@@ -8,13 +8,11 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 
-
-/**
- * 关系事件处理器。
- * 职责：对 FollowCreated/FollowCanceled 事件进行去重、防抖与幂等处理，落库更新粉丝表，维护关注/粉丝 ZSet 缓存与 TTL，并原子更新用户维度计数（SDS）。
- */
 @Service
 public class RelationEventProcessor {
+    private static final Duration RELATION_CACHE_TTL = Duration.ofHours(2);
+    private static final int FANS_CACHE_LIMIT = 500;
+
     private final RelationMapper mapper;
     private final StringRedisTemplate redis;
     private final UserCounterService userCounterService;
@@ -25,10 +23,6 @@ public class RelationEventProcessor {
         this.userCounterService = userCounterService;
     }
 
-    /**
-     * 处理关系事件：入库、更新缓存、刷新计数，并进行幂等去重。
-     * @param evt 关系事件
-     */
     public void process(RelationEvent evt) {
         String dk = "dedup:rel:" + evt.type() + ":" + evt.fromUserId() + ":" + evt.toUserId() + ":" + (evt.id() == null ? "0" : String.valueOf(evt.id()));
         Boolean first = redis.opsForValue().setIfAbsent(dk, "1", Duration.ofMinutes(10));
@@ -37,31 +31,74 @@ public class RelationEventProcessor {
             return;
         }
         if ("FollowCreated".equals(evt.type())) {
-            // 异步插入粉丝表
             mapper.insertFollower(evt.id(), evt.toUserId(), evt.fromUserId(), 1);
             long now = System.currentTimeMillis();
 
-            // 更新关注表与粉丝表缓存：ZSet 按时间分数维护最近项，设置短 TTL 减少陈旧数据
-            redis.opsForZSet().add("uf:flws:" + evt.fromUserId(), String.valueOf(evt.toUserId()), now);
-            redis.opsForZSet().add("uf:fans:" + evt.toUserId(), String.valueOf(evt.fromUserId()), now);
-            redis.expire("uf:flws:" + evt.fromUserId(), Duration.ofHours(2));
-            redis.expire("uf:fans:" + evt.toUserId(), Duration.ofHours(2));
+            updateFollowingCacheOnCreate(evt, now);
+            updateFansCacheOnCreate(evt, now);
 
-            // 更新关注数与粉丝数
             userCounterService.incrementFollowings(evt.fromUserId(), 1);
             userCounterService.incrementFollowers(evt.toUserId(), 1);
         } else if ("FollowCanceled".equals(evt.type())) {
             mapper.cancelFollower(evt.toUserId(), evt.fromUserId());
 
-            // 更新关注表与粉丝表缓存：移除 ZSet 项并刷新 TTL
-            redis.opsForZSet().remove("uf:flws:" + evt.fromUserId(), String.valueOf(evt.toUserId()));
-            redis.opsForZSet().remove("uf:fans:" + evt.toUserId(), String.valueOf(evt.fromUserId()));
-            redis.expire("uf:flws:" + evt.fromUserId(), Duration.ofHours(2));
-            redis.expire("uf:fans:" + evt.toUserId(), Duration.ofHours(2));
+            updateFollowingCacheOnCancel(evt);
+            updateFansCacheOnCancel(evt);
 
-            // 更新关注数与粉丝数
             userCounterService.incrementFollowings(evt.fromUserId(), -1);
             userCounterService.incrementFollowers(evt.toUserId(), -1);
         }
+    }
+
+    private void updateFollowingCacheOnCreate(RelationEvent evt, long score) {
+        String key = followingKey(evt.fromUserId());
+        if (!Boolean.TRUE.equals(redis.hasKey(key))) {
+            return;
+        }
+        redis.opsForZSet().add(key, String.valueOf(evt.toUserId()), score);
+        redis.expire(key, RELATION_CACHE_TTL);
+    }
+
+    private void updateFansCacheOnCreate(RelationEvent evt, long score) {
+        String key = fansKey(evt.toUserId());
+        if (!Boolean.TRUE.equals(redis.hasKey(key))) {
+            return;
+        }
+        redis.opsForZSet().add(key, String.valueOf(evt.fromUserId()), score);
+        trimFansCache(key);
+        redis.expire(key, RELATION_CACHE_TTL);
+    }
+
+    private void updateFollowingCacheOnCancel(RelationEvent evt) {
+        String key = followingKey(evt.fromUserId());
+        if (!Boolean.TRUE.equals(redis.hasKey(key))) {
+            return;
+        }
+        redis.opsForZSet().remove(key, String.valueOf(evt.toUserId()));
+        redis.expire(key, RELATION_CACHE_TTL);
+    }
+
+    private void updateFansCacheOnCancel(RelationEvent evt) {
+        String key = fansKey(evt.toUserId());
+        if (!Boolean.TRUE.equals(redis.hasKey(key))) {
+            return;
+        }
+        redis.opsForZSet().remove(key, String.valueOf(evt.fromUserId()));
+        redis.expire(key, RELATION_CACHE_TTL);
+    }
+
+    private void trimFansCache(String key) {
+        Long size = redis.opsForZSet().zCard(key);
+        if (size != null && size > FANS_CACHE_LIMIT) {
+            redis.opsForZSet().removeRange(key, 0, size - FANS_CACHE_LIMIT - 1);
+        }
+    }
+
+    private String followingKey(long userId) {
+        return "uf:flws:" + userId;
+    }
+
+    private String fansKey(long userId) {
+        return "uf:fans:" + userId;
     }
 }

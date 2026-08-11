@@ -102,6 +102,14 @@ public interface RelationMapper {
                                                      @Param("limit") int limit,
                                                      @Param("offset") int offset);
 
+    @MapKey("toUserId")
+    Map<Long, Map<String, Object>> listAllFollowingRows(@Param("fromUserId") Long fromUserId);
+
+    @MapKey("toUserId")
+    Map<Long, Map<String, Object>> listFollowingRowsBeforeCursor(@Param("fromUserId") Long fromUserId,
+                                                                 @Param("cursor") Long cursor,
+                                                                 @Param("limit") int limit);
+
     /**
      * 列出粉丝行用于缓存回填（包含 createdAt）。
      * @param toUserId 被关注者
@@ -113,6 +121,19 @@ public interface RelationMapper {
     Map<Long, Map<String, Object>> listFollowerRows(@Param("toUserId") Long toUserId,
                                                     @Param("limit") int limit,
                                                     @Param("offset") int offset);
+
+    @MapKey("fromUserId")
+    Map<Long, Map<String, Object>> listTopFollowerRows(@Param("toUserId") Long toUserId,
+                                                       @Param("limit") int limit);
+
+    @MapKey("fromUserId")
+    Map<Long, Map<String, Object>> listFollowerRowsBeforeCursor(@Param("toUserId") Long toUserId,
+                                                                @Param("cursor") Long cursor,
+                                                                @Param("limit") int limit);
+
+    List<Long> listFollowersBeforeCursor(@Param("toUserId") Long toUserId,
+                                         @Param("cursor") Long cursor,
+                                         @Param("limit") int limit);
 
     /**
      * 统计关注数（有效关系）。

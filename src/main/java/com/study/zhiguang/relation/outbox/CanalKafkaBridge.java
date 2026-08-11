@@ -97,7 +97,6 @@ public class CanalKafkaBridge implements SmartLifecycle {
         running = true;
         taskExecutor.execute(() -> {
             try {
-                // 创建 Canal 单实例连接器并建立连接
                 connector = CanalConnectors.newSingleConnector(new InetSocketAddress(host, port), destination, username, password);
                 log.info("Canal connecting to {}:{} dest={} user={} filter={}", host, port, destination, username, filter);
                 connector.connect();
@@ -106,10 +105,8 @@ public class CanalKafkaBridge implements SmartLifecycle {
                 connector.rollback();
                 log.info("Canal connected and subscribed: host={} port={} dest={} filter={} batchSize={} intervalMs={}ms", host, port, destination, filter, batchSize, intervalMs);
                 while (running) {
-                    // 拉取一批未确认消息（不自动 ack）
                     Message message = connector.getWithoutAck(batchSize);
                     long batchId = message.getId();
-                    // 空批次或心跳时，按间隔休眠并继续轮询
                     if (batchId == -1 || message.getEntries() == null || message.getEntries().isEmpty()) {
                         try {
                             Thread.sleep(intervalMs);
@@ -117,19 +114,16 @@ public class CanalKafkaBridge implements SmartLifecycle {
                         continue;
                     }
                     for (CanalEntry.Entry entry : message.getEntries()) {
-                        // 仅处理行级数据变更事件
                         if (entry.getEntryType() != CanalEntry.EntryType.ROWDATA) {
                             continue;
                         }
                         CanalEntry.RowChange rowChange;
                         try {
-                            // 解析二进制为 RowChange（包含 INSERT/UPDATE 的行变更）
                             rowChange = CanalEntry.RowChange.parseFrom(entry.getStoreValue());
                         } catch (Exception e) {
                             continue;
                         }
                         CanalEntry.EventType eventType = rowChange.getEventType();
-                        // 仅转发 INSERT/UPDATE 事件，忽略其他类型
                         if (eventType != CanalEntry.EventType.INSERT && eventType != CanalEntry.EventType.UPDATE) {
                             continue;
                         }
@@ -151,11 +145,11 @@ public class CanalKafkaBridge implements SmartLifecycle {
                         msgNode.set("data", dataArray);
 
                         try {
-                            // 序列化并发送到 Kafka 主题（canal-outbox）
                             String json = objectMapper.writeValueAsString(msgNode);
                             kafka.send(OutboxTopics.CANAL_OUTBOX, json);
                         } catch (Exception ignored) {}
                     }
+                    connector.ack(batchId);
                 }
             } catch (Exception e) {
                 log.error("Canal bridge error", e);

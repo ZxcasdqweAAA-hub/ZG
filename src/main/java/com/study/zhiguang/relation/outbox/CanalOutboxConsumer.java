@@ -44,7 +44,7 @@ public class CanalOutboxConsumer {
                 RelationEvent event = objectMapper.readValue(payload.asText(), RelationEvent.class);
                 processor.process(event);
             }
-
+            ack.acknowledge();
         } catch (Exception ignored) {}
     }
 
